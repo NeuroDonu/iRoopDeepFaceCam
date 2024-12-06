@@ -650,63 +650,76 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
 def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
     landmarks = face.landmark_2d_106
+    
     if landmarks is not None:
-        # Convert landmarks to int32
-        landmarks = landmarks.astype(np.int32)
+        # Define the face outline indices
+        face_outline_indices = [1,43,48,49,104,105,17,25,26,27,28,29,30,31,32,18,19,20,21,22,23,24,0,8,7,6,5,4,3,2,16,15,14,13,12,11,10,9,1]
         
-        # Extract facial features
-        right_side_face = landmarks[0:16]
-        left_side_face = landmarks[17:32]
-        right_eye = landmarks[33:42]
-        right_eye_brow = landmarks[43:51]
-        left_eye = landmarks[87:96]
-        left_eye_brow = landmarks[97:105]
-
-        # Calculate forehead extension
-        right_eyebrow_top = np.min(right_eye_brow[:, 1])
-        left_eyebrow_top = np.min(left_eye_brow[:, 1])
-        eyebrow_top = min(right_eyebrow_top, left_eyebrow_top)
+        # Extract face outline landmarks
+        face_outline_landmarks = landmarks[face_outline_indices].astype(np.float32)
         
-        face_top = np.min([right_side_face[0, 1], left_side_face[-1, 1]])
-        forehead_height = face_top - eyebrow_top
-        extended_forehead_height = int(forehead_height * 5.0)  # Extend by 50%
-
-        # Create forehead points
-        forehead_left = right_side_face[0].copy()
-        forehead_right = left_side_face[-1].copy()
-        forehead_left[1] -= extended_forehead_height
-        forehead_right[1] -= extended_forehead_height
-
-        # Combine all points to create the face outline
-        face_outline = np.vstack([
-            [forehead_left],
-            right_side_face,
-            left_side_face[::-1],  # Reverse left side to create a continuous outline
-            [forehead_right]
-        ])
-
-        # Calculate padding
-        padding = int(np.linalg.norm(right_side_face[0] - left_side_face[-1]) * 0.05)  # 5% of face width
-
-        # Create a slightly larger convex hull for padding
-        hull = cv2.convexHull(face_outline)
+        # Get eyebrow top points (indices 49 and 104)
+        left_eyebrow_top = landmarks[49].astype(np.float32)
+        right_eyebrow_top = landmarks[104].astype(np.float32)
+        
+        # Calculate extra forehead padding (50% of face height)
+        face_height = np.abs(np.mean([left_eyebrow_top[1], right_eyebrow_top[1]]) - 
+                           np.max(face_outline_landmarks[:, 1]))
+        forehead_padding = int(face_height * 0.5)  # Adjust this multiplier for more/less padding
+        
+        # Create new points above the eyebrows for forehead extension
+        forehead_points = []
+        for point in face_outline_landmarks:
+            x, y = point
+            # Add more padding to points near the top of the face
+            if y < face_outline_landmarks[:, 1].mean():  # If point is in upper half of face
+                y_offset = forehead_padding
+                # Add two points with slight x offsets for smoother curve
+                forehead_points.extend([
+                    [x - 5, y - y_offset],
+                    [x, y - y_offset],
+                    [x + 5, y - y_offset]
+                ])
+        
+        # Combine original landmarks with forehead points
+        all_points = np.vstack([face_outline_landmarks, np.array(forehead_points)])
+        
+        # Calculate the center of the face for padding calculations
+        face_center = np.mean(all_points, axis=0)
+        
+        # Calculate padding (5% of face width)
+        face_width = np.linalg.norm(
+            face_outline_landmarks[0] - face_outline_landmarks[len(face_outline_indices)//2]
+        )
+        padding = int(face_width * 0.05)
+        
+        # Create padded hull points
+        hull = cv2.convexHull(all_points.astype(np.int32))
         hull_padded = []
+        
         for point in hull:
             x, y = point[0]
-            center = np.mean(face_outline, axis=0)
-            direction = np.array([x, y]) - center
-            direction = direction / np.linalg.norm(direction)
-            padded_point = np.array([x, y]) + direction * padding
-            hull_padded.append(padded_point)
-
+            direction = np.array([x, y]) - face_center
+            # Normalize direction vector
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm > 0:  # Avoid division by zero
+                direction = direction / direction_norm
+                # Add extra padding for points near the top
+                current_padding = padding
+                if y < all_points[:, 1].mean():  # If point is in upper half
+                    current_padding *= 1.5  # 50% extra padding for top points
+                padded_point = np.array([x, y]) + direction * current_padding
+                hull_padded.append(padded_point)
+        
+        # Convert padded hull points to int32
         hull_padded = np.array(hull_padded, dtype=np.int32)
-
+        
         # Fill the padded convex hull
         cv2.fillConvexPoly(mask, hull_padded, 255)
-
+        
         # Smooth the mask edges
         mask = cv2.GaussianBlur(mask, (5, 5), 3)
-
+    
     return mask
 
 def blur_edges(mask: np.ndarray, blur_amount: int = 40) -> np.ndarray:
